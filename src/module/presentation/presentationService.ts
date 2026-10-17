@@ -387,21 +387,6 @@ class PresentationService {
     };
   }
 
-  /**
-   * Extract the first verse number from
-   * a Bible reference.
-   *
-   * Examples:
-   *
-   * John 3:16
-   * → 16
-   *
-   * John 3:16-18
-   * → 16
-   *
-   * John 3
-   * → no explicit verse → 0
-   */
   private findReferenceVerseIndex(
     reference: string,
     verses: PresentationVerse[],

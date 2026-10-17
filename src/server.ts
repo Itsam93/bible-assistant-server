@@ -1,251 +1,119 @@
-import http from "node:http";
 
+import http from "node:http";
 import cors from "cors";
 import express from "express";
 import { Server } from "socket.io";
 
 import bibleRoutes from "./module/bible/bibleRoutes";
-
 import presentationRoutes from "./module/presentation/presentationRoutes";
-
-import {
-  presentationService,
-} from "./module/presentation/presentationService";
-
-import {
-  registerVoiceSocketHandlers,
-} from "./module/voice/handlers/voice.socket-handler";
-
-/*
- * --------------------------------------------------
- * Application
- * --------------------------------------------------
- */
+import { presentationService } from "./module/presentation/presentationService";
+import { registerVoiceSocketHandlers } from "./module/voice/handlers/voice.socket-handler";
 
 const app = express();
+const httpServer = http.createServer(app);
 
-const httpServer =
-  http.createServer(app);
+const PORT = Number(process.env.PORT ?? 5000);
 
-/*
- * --------------------------------------------------
- * Configuration
- * --------------------------------------------------
- */
+const configuredOrigins = [
+  process.env.CLIENT_URL,
+  ...(process.env.CLIENT_URLS?.split(",") ?? []),
+]
+  .map((origin) => origin?.trim().replace(/\/+$/, ""))
+  .filter((origin): origin is string => Boolean(origin));
 
-const PORT = Number(
-  process.env.PORT ?? 5000,
-);
+const allowedOrigins = [
+  ...new Set([
+    ...configuredOrigins,
+    ...(process.env.NODE_ENV !== "production"
+      ? ["http://localhost:5173", "http://localhost:5174"]
+      : []),
+  ]),
+];
 
-const CLIENT_URL =
-  process.env.CLIENT_URL ??
-  "http://localhost:5173";
+if (process.env.NODE_ENV === "production" && allowedOrigins.length === 0) {
+  throw new Error(
+    "Configure CLIENT_URL or CLIENT_URLS with your deployed frontend origin.",
+  );
+}
 
-/*
- * --------------------------------------------------
- * Middleware
- * --------------------------------------------------
- */
+const isAllowedOrigin = (
+  origin: string | undefined,
+): boolean => {
+  if (!origin) {
+    return true;
+  }
+
+  return allowedOrigins.includes(origin.replace(/\/+$/, ""));
+};
 
 app.use(
   cors({
-    origin: CLIENT_URL,
+    origin: (origin, callback) => {
+      if (isAllowedOrigin(origin)) {
+        callback(null, true);
+        return;
+      }
+
+      callback(new Error(`Origin not allowed by CORS: ${origin}`));
+    },
     credentials: true,
   }),
 );
 
-app.use(
-  express.json(),
-);
+app.use(express.json());
 
-/*
- * --------------------------------------------------
- * Health Check
- * --------------------------------------------------
- */
+app.get("/api/health", (_req, res) => {
+  res.status(200).json({
+    success: true,
+    service: "ai-bible-presenter",
+    status: "ok",
+  });
+});
 
-app.get(
-  "/api/health",
-  (_req, res) => {
-    res.status(200).json({
-      success: true,
+app.use("/api/bible", bibleRoutes);
 
-      service:
-        "ai-bible-presenter",
-
-      status:
-        "ok",
-    });
+const io = new Server(httpServer, {
+  cors: {
+    origin: allowedOrigins,
+    credentials: true,
+    methods: ["GET", "POST"],
   },
-);
-
-/*
- * --------------------------------------------------
- * Bible API
- * --------------------------------------------------
- */
-
-app.use(
-  "/api/bible",
-  bibleRoutes,
-);
-
-/*
- * --------------------------------------------------
- * Socket.IO
- * --------------------------------------------------
- *
- * A single Socket.IO server is shared by:
- *
- * - Presentation
- * - Voice
- *
- * The individual modules register their own
- * socket event handlers.
- * --------------------------------------------------
- */
-
-const io =
-  new Server(
-    httpServer,
-    {
-      cors: {
-        origin:
-          CLIENT_URL,
-
-        credentials:
-          true,
-      },
-    },
-  );
-
-/*
- * --------------------------------------------------
- * Presentation API
- * --------------------------------------------------
- *
- * Presentation HTTP routes receive the same
- * Socket.IO instance so that state changes can
- * immediately be broadcast to connected clients.
- * --------------------------------------------------
- */
+});
 
 app.use(
   "/api/presentation",
   presentationRoutes(io),
 );
 
-/*
- * --------------------------------------------------
- * Socket.IO Connections
- * --------------------------------------------------
- */
+io.on("connection", (socket) => {
+  console.log(
+    `[Socket.IO] Client connected: ${socket.id}; origin: ${
+      socket.handshake.headers.origin ?? "unknown"
+    }`,
+  );
 
-io.on(
-  "connection",
-  (socket) => {
+  // Send the authoritative current state to the new client.
+  socket.emit(
+    "presentation:state",
+    presentationService.getState(),
+  );
+
+  socket.emit("presentation:connected", {
+    success: true,
+    message: "Connected to Bible presentation server.",
+  });
+
+  registerVoiceSocketHandlers(io, socket);
+
+  socket.on("disconnect", (reason) => {
     console.log(
-      `[Socket.IO] Client connected: ${socket.id}`,
+      `[Socket.IO] Client disconnected: ${socket.id} (${reason})`,
     );
+  });
+});
 
-    /*
-     * ------------------------------------------------
-     * Presentation State
-     * ------------------------------------------------
-     *
-     * Send the current presentation state immediately
-     * to every newly connected client.
-     *
-     * This allows a presentation/projector client to
-     * recover the currently active scripture after
-     * connecting or refreshing.
-     * ------------------------------------------------
-     */
-
-    socket.emit(
-      "presentation:state",
-      presentationService.getState(),
-    );
-
-    /*
-     * ------------------------------------------------
-     * Presentation Connection Event
-     * ------------------------------------------------
-     */
-
-    socket.emit(
-      "presentation:connected",
-      {
-        success: true,
-
-        message:
-          "Connected to Bible presentation server.",
-      },
-    );
-
-    /*
-     * ------------------------------------------------
-     * Voice Socket Handlers
-     * ------------------------------------------------
-     *
-     * Register:
-     *
-     * - voice:transcript
-     * - voice:clear-transcript
-     * - voice:reset-transcript
-     * - voice:scripture-detected
-     * - voice:transcript-result
-     * - voice:error
-     *
-     * The voice handler owns the voice pipeline.
-     * ------------------------------------------------
-     */
-
-    registerVoiceSocketHandlers(
-      io,
-      socket,
-    );
-
-    /*
-     * ------------------------------------------------
-     * Disconnect
-     * ------------------------------------------------
-     */
-
-    socket.on(
-      "disconnect",
-      (reason) => {
-        console.log(
-          `[Socket.IO] Client disconnected: ${socket.id} (${reason})`,
-        );
-      },
-    );
-  },
-);
-
-/*
- * --------------------------------------------------
- * Start Server
- * --------------------------------------------------
- */
-
-httpServer.listen(
-  PORT,
-  () => {
-    console.log(
-      `AI Bible Presenter server running on http://localhost:${PORT}`,
-    );
-
-    console.log(
-      `Bible API: http://localhost:${PORT}/api/bible`,
-    );
-
-    console.log(
-      `Presentation API: http://localhost:${PORT}/api/presentation`,
-    );
-
-    console.log(
-      `Socket.IO: ws://localhost:${PORT}`,
-    );
-  },
-);
+httpServer.listen(PORT, () => {
+  console.log(`Bible Presenter server listening on port ${PORT}`);
+  console.log("Allowed frontend origins:", allowedOrigins);
+  console.log(`Health check: /api/health`);
+});
